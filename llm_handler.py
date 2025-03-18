@@ -1,146 +1,173 @@
+import json
+import os
 import logging
 import time
-import os
-import json
-from huggingface_hub import InferenceClient
-from threading import Lock
+from openai import OpenAI
+
+# the newest OpenAI model is "gpt-4o" which was released May 13, 2024.
+# do not change this unless explicitly requested by the user
 
 logger = logging.getLogger(__name__)
 
-# API token (optional)
-HUGGINGFACE_API_TOKEN = os.environ.get("HUGGINGFACE_API_TOKEN")
-
-# Use a lock to prevent multiple simultaneous requests
-api_lock = Lock()
-
-# Initialize cache for responses to reduce API calls
-response_cache = {}
-CACHE_SIZE_LIMIT = 100
-CACHE_EXPIRE_SECONDS = 3600  # 1 hour
-
 class LLMHandler:
     def __init__(self):
-        """Initialize the LLM handler with a Hugging Face model"""
-        self.logger = logging.getLogger(__name__)
-        self.logger.info("Initializing LLM Handler")
+        """Initialize the LLM handler with OpenAI"""
+        self.api_key = os.environ.get("OPENAI_API_KEY")
+        self.client = None
+        self.cache = {}  # Simple in-memory cache
+        self.cache_ttl = 3600  # Cache TTL in seconds (1 hour)
+        self.model = "gpt-4o"  # Using the latest model
         
-        # Set up the Hugging Face client - use a smaller open source model
-        try:
-            # If token is available, use it
-            if HUGGINGFACE_API_TOKEN:
-                self.client = InferenceClient(token=HUGGINGFACE_API_TOKEN)
-                self.logger.info("Using authenticated Hugging Face client")
-            else:
-                self.client = InferenceClient()
-                self.logger.info("Using anonymous Hugging Face client")
-            
-            # Default to a lightweight model that's good for chat and instruction following
-            self.model = "google/flan-t5-small"  # Smaller model that should work with limited resources
-            self.logger.info(f"Using model: {self.model}")
-            
-            self.initialized = True
-        except Exception as e:
-            self.logger.error(f"Error initializing LLM Handler: {e}")
-            self.initialized = False
+        if self.api_key:
+            try:
+                self.client = OpenAI(api_key=self.api_key)
+                logger.info("OpenAI client initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize OpenAI client: {e}")
+                self.client = None
+        else:
+            logger.warning("OpenAI API key not found in environment variables")
     
     def _clean_cache(self):
-        """Remove expired or excess cache entries"""
+        """Remove expired cache entries"""
         current_time = time.time()
-        # Remove expired entries
-        expired_keys = [k for k, v in response_cache.items() 
-                       if current_time - v['timestamp'] > CACHE_EXPIRE_SECONDS]
-        for k in expired_keys:
-            del response_cache[k]
-        
-        # If still too many entries, remove oldest
-        if len(response_cache) > CACHE_SIZE_LIMIT:
-            sorted_keys = sorted(response_cache.keys(), 
-                               key=lambda k: response_cache[k]['timestamp'])
-            for k in sorted_keys[:len(response_cache) - CACHE_SIZE_LIMIT]:
-                del response_cache[k]
+        expired_keys = [k for k, v in self.cache.items() if current_time - v["timestamp"] > self.cache_ttl]
+        for key in expired_keys:
+            del self.cache[key]
     
-    def generate_response(self, prompt, safety_context=None, max_length=150):
-        """Generate a response using the LLM based on a prompt and safety context"""
-        if not self.initialized:
-            return "I'm currently experiencing technical difficulties. Please try again later."
+    def generate_response(self, prompt, safety_context=None, max_length=250):
+        """Generate a response using OpenAI based on a prompt and safety context"""
+        if not self.client:
+            return self.generate_response_with_fallback(prompt, safety_context)
         
-        # Create a cache key from the prompt and context
+        # Clean cache periodically
+        self._clean_cache()
+        
+        # Create a cache key based on prompt and context
         cache_key = f"{prompt}_{str(safety_context)}"
-        
-        # Check cache first
-        if cache_key in response_cache:
-            self.logger.info("Using cached response")
-            return response_cache[cache_key]['response']
-        
-        # Build full context with safety information
-        if safety_context:
-            full_prompt = f"""
-You are a helpful safety assistant. Use the following safety information to answer the question.
-Safety Context: {safety_context}
-
-User Question: {prompt}
-
-Response:
-"""
-        else:
-            full_prompt = f"""
-You are a helpful safety assistant specializing in workplace and chemical safety.
-Answer the following question concisely using your knowledge of safety protocols.
-
-User Question: {prompt}
-
-Response:
-"""
+        if cache_key in self.cache:
+            logger.info("Returning cached response")
+            return self.cache[cache_key]["response"]
         
         try:
-            with api_lock:  # Ensure only one API call at a time
-                self.logger.info(f"Sending prompt to model: {self.model}")
+            # Prepare the messages for the API call
+            messages = [{"role": "system", "content": "You are a safety information assistant. Provide helpful, accurate, and concise information about safety protocols, incidents, and hazard management."}]
+            
+            # Add safety context if provided
+            if safety_context:
+                context_message = "Here is some relevant safety information:\n\n"
+                if isinstance(safety_context, list):
+                    for item in safety_context:
+                        if isinstance(item, dict):
+                            context_message += json.dumps(item, indent=2) + "\n\n"
+                        else:
+                            context_message += str(item) + "\n\n"
+                else:
+                    context_message += str(safety_context)
                 
-                # Call the Hugging Face API
-                response = self.client.text_generation(
-                    full_prompt,
-                    model=self.model,
-                    max_new_tokens=max_length,
-                    temperature=0.7,
-                    repetition_penalty=1.2,
-                    do_sample=True
-                )
-                
-                # Cache the response
-                response_cache[cache_key] = {
-                    'response': response,
-                    'timestamp': time.time()
-                }
-                
-                # Clean cache occasionally
-                if len(response_cache) % 10 == 0:
-                    self._clean_cache()
-                
-                return response
-                
+                messages.append({"role": "system", "content": context_message})
+            
+            # Add the user's prompt
+            messages.append({"role": "user", "content": prompt})
+            
+            # Make the API call
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=max_length,
+                temperature=0.5,  # Lower temperature for more focused responses
+            )
+            
+            generated_text = response.choices[0].message.content
+            
+            # Cache the response
+            self.cache[cache_key] = {
+                "response": generated_text,
+                "timestamp": time.time()
+            }
+            
+            return generated_text
+            
         except Exception as e:
-            self.logger.error(f"Error generating LLM response: {e}")
-            # Provide a fallback response
-            return ("I'm sorry, I couldn't generate a response at this time. "
-                   "Please try again with a different question.")
-
+            logger.error(f"Error generating response from OpenAI: {e}")
+            return self.generate_response_with_fallback(prompt, safety_context)
+    
     def generate_response_with_fallback(self, prompt, safety_documents=None):
-        """Generate a response with fallbacks if LLM is unavailable"""
-        if not self.initialized:
-            self.logger.warning("LLM not initialized, using fallback response")
-            # If we have safety documents, use those for a fallback response
-            if safety_documents and len(safety_documents) > 0:
-                # Create a simple text response based on the most relevant document
-                doc = safety_documents[0]
-                return f"Based on our safety information: {doc.get('content', '')[:200]}..."
-            else:
-                return ("I'm a safety assistant here to help with workplace safety questions. "
-                       "Ask me about chemical handling, emergency procedures, or safety protocols.")
+        """Generate a response with fallbacks if OpenAI is unavailable"""
+        logger.warning("Using fallback response generation")
         
-        # If we have safety documents, use them as context
-        safety_context = None
-        if safety_documents and len(safety_documents) > 0:
-            safety_context = "\n".join([doc.get('content', '') for doc in safety_documents[:2]])
+        # Basic template-based responses for common safety queries
+        if "chemical spill" in prompt.lower():
+            return ("For chemical spills: 1) Evacuate the area, 2) Alert safety personnel, "
+                   "3) Identify the chemical if possible, 4) Contain the spill using appropriate "
+                   "materials, 5) Clean up according to safety protocols for the specific chemical.")
         
-        # Generate the LLM response
-        return self.generate_response(prompt, safety_context)
+        elif "fire" in prompt.lower() or "evacuation" in prompt.lower():
+            return ("In case of fire: 1) Activate the nearest fire alarm, 2) Call emergency services, "
+                   "3) Evacuate using designated routes, 4) Assemble at the designated meeting point, "
+                   "5) Do not use elevators, 6) If trained and if safe to do so, use fire extinguishers "
+                   "for small fires.")
+        
+        elif "protective equipment" in prompt.lower() or "ppe" in prompt.lower():
+            return ("Personal Protective Equipment (PPE) requirements depend on the hazard. "
+                   "General guidelines include: 1) Eye protection for chemical or particulate hazards, "
+                   "2) Gloves appropriate to the material being handled, 3) Respiratory protection "
+                   "for airborne hazards, 4) Protective clothing for chemical, thermal, or radiation hazards.")
+        
+        # If safety documents are provided, attempt to extract relevant information
+        if safety_documents:
+            # Simple approach: look for keyword matches in the documents
+            keywords = prompt.lower().split()
+            relevant_info = []
+            
+            for doc in safety_documents:
+                if isinstance(doc, dict):
+                    # For dictionaries, check values for matches
+                    for key, value in doc.items():
+                        if isinstance(value, str):
+                            for keyword in keywords:
+                                if keyword in value.lower():
+                                    relevant_info.append(f"{key}: {value}")
+                elif isinstance(doc, str):
+                    # For strings, check for keyword matches
+                    for keyword in keywords:
+                        if keyword in doc.lower():
+                            relevant_info.append(doc)
+            
+            if relevant_info:
+                return "Based on available information:\n\n" + "\n\n".join(relevant_info)
+        
+        # Default response if no specific template or document matches
+        return ("I'm your safety assistant. I can help with safety protocols, incident information, "
+               "and risk assessments. Please provide specific details about your safety query for "
+               "more tailored information.")
+
+    def analyze_sentiment(self, text):
+        """Analyze the sentiment of the given text"""
+        if not self.client:
+            return {"rating": 3, "confidence": 0.5}  # Default neutral rating
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a sentiment analysis expert. "
+                        + "Analyze the sentiment of the text and provide a rating "
+                        + "from 1 to 5 stars and a confidence score between 0 and 1. "
+                        + "Respond with JSON in this format: "
+                        + "{'rating': number, 'confidence': number}",
+                    },
+                    {"role": "user", "content": text},
+                ],
+                response_format={"type": "json_object"},
+            )
+            result = json.loads(response.choices[0].message.content)
+            return {
+                "rating": max(1, min(5, round(result["rating"]))),
+                "confidence": max(0, min(1, result["confidence"])),
+            }
+        except Exception as e:
+            logger.error(f"Error analyzing sentiment: {e}")
+            return {"rating": 3, "confidence": 0.5}  # Default neutral rating

@@ -5,6 +5,7 @@ from datetime import datetime
 import nltk
 from nltk.tokenize import sent_tokenize
 import numpy as np
+from llm_handler import LLMHandler
 
 # Initialize NLTK components
 try:
@@ -20,6 +21,7 @@ class SafetyProcessor:
         self.emergency_guidebook = self._load_emergency_guidebook()
         self.incident_reports = self._load_incident_reports()
         self.logger = logging.getLogger(__name__)
+        self.llm_handler = LLMHandler()
         self.logger.info("SafetyProcessor initialized")
     
     def _load_emergency_guidebook(self):
@@ -180,6 +182,28 @@ class SafetyProcessor:
         # Combine information from the most relevant results
         top_results = results[:3]  # Use top 3 most relevant results
         
+        # Try using the LLM handler for generating a response
+        try:
+            # Prepare context from the search results
+            context = []
+            for result in top_results:
+                context.append(result)
+            
+            # Create a prompt for the LLM
+            prompt = f"User query: {query}\n\nPlease provide a helpful and informative response to this safety question. Include specific protocols, emergency procedures, and relevant incident information if applicable."
+            
+            # Generate response using the LLM
+            llm_response = self.llm_handler.generate_response(prompt, context)
+            
+            if llm_response and len(llm_response.strip()) > 10:
+                return llm_response
+                
+        except Exception as e:
+            self.logger.error(f"Error using LLM for contextual answer: {e}")
+        
+        # Fallback to template-based answers if LLM fails
+        self.logger.warning("Falling back to template-based contextual answers")
+        
         answer_components = []
         
         for result in top_results:
@@ -201,44 +225,87 @@ class SafetyProcessor:
         """Generate response for chatbot based on user message and intent"""
         self.logger.debug(f"Generating chat response for message with intent: {intent}")
         
+        # First gather relevant context based on intent and message
+        context_data = []
+        
         if intent == "emergency_protocol":
             # Look for emergency protocols
             for material in self.emergency_guidebook["hazardous_materials"]:
                 if any(keyword in material["name"].lower() or keyword in material["description"].lower() 
                       for keyword in message.lower().split()):
-                    protocols = "\n- " + "\n- ".join(material["protocols"])
-                    return f"Emergency protocols for {material['name']}:{protocols}\n\nEmergency response: {material['emergency_response']}"
-            
-            return "I couldn't find specific emergency protocols for that situation. Please provide more details about the hazardous material or incident type."
+                    context_data.append(material)
         
         elif intent == "incident_inquiry":
             # Look for similar past incidents
-            similar_incidents = []
-            
             for incident in self.incident_reports["incidents"]:
                 if any(keyword in incident["title"].lower() or keyword in incident["description"].lower() 
                       for keyword in message.lower().split()):
-                    similar_incidents.append(incident)
-            
-            if similar_incidents:
-                incident = similar_incidents[0]  # Take the first match for simplicity
-                return f"I found a similar incident: {incident['title']} (ID: {incident['id']})\n\nDescription: {incident['description']}\n\nResolution: {incident['resolution']}"
-            
-            return "I couldn't find any similar past incidents in our records. This may be a new scenario."
+                    context_data.append(incident)
         
         elif intent == "risk_assessment":
-            # Provide risk assessment information
+            # Find relevant hazardous materials information
             keywords = message.lower().split()
-            
             for material in self.emergency_guidebook["hazardous_materials"]:
-                if any(keyword in material["name"].lower() for keyword in keywords):
-                    return f"Risk assessment for {material['name']}:\n\n{material['description']}\n\nThis is a significant hazard that requires proper safety protocols."
-            
-            return "I need more specific information about the hazardous materials or situation to provide a risk assessment."
+                if any(keyword in material["name"].lower() or keyword in material["description"].lower() 
+                      for keyword in keywords):
+                    context_data.append(material)
         
+        # Construct a prompt based on intent and gathered context
+        prompt = f"User query: {message}\n\nIntent: {intent}\n\n"
+        
+        if intent == "emergency_protocol":
+            prompt += "Please provide detailed emergency protocols and safety procedures for this situation. List steps clearly."
+        elif intent == "incident_inquiry":
+            prompt += "Describe similar incidents and their resolutions. Include key details and lessons learned."
+        elif intent == "risk_assessment":
+            prompt += "Assess the potential risks and hazards in this situation. Include severity, likelihood, and recommended precautions."
         else:
-            # General response
-            return "I'm your safety assistant. I can help with emergency protocols, incident information, or risk assessments. Please provide more details about what you need."
+            prompt += "Provide helpful safety information related to this query."
+        
+        # Use the LLM handler to generate a response with the gathered context
+        llm_response = self.llm_handler.generate_response(prompt, context_data)
+        
+        # If the LLM handler fails or returns an empty response, fall back to the original method
+        if not llm_response or llm_response.strip() == "":
+            self.logger.warning("LLM response was empty, using fallback response generation")
+            # Original keyword-based response generation as fallback
+            if intent == "emergency_protocol":
+                for material in self.emergency_guidebook["hazardous_materials"]:
+                    if any(keyword in material["name"].lower() or keyword in material["description"].lower() 
+                          for keyword in message.lower().split()):
+                        protocols = "\n- " + "\n- ".join(material["protocols"])
+                        return f"Emergency protocols for {material['name']}:{protocols}\n\nEmergency response: {material['emergency_response']}"
+                
+                return "I couldn't find specific emergency protocols for that situation. Please provide more details about the hazardous material or incident type."
+            
+            elif intent == "incident_inquiry":
+                similar_incidents = []
+                
+                for incident in self.incident_reports["incidents"]:
+                    if any(keyword in incident["title"].lower() or keyword in incident["description"].lower() 
+                          for keyword in message.lower().split()):
+                        similar_incidents.append(incident)
+                
+                if similar_incidents:
+                    incident = similar_incidents[0]  # Take the first match for simplicity
+                    return f"I found a similar incident: {incident['title']} (ID: {incident['id']})\n\nDescription: {incident['description']}\n\nResolution: {incident['resolution']}"
+                
+                return "I couldn't find any similar past incidents in our records. This may be a new scenario."
+            
+            elif intent == "risk_assessment":
+                keywords = message.lower().split()
+                
+                for material in self.emergency_guidebook["hazardous_materials"]:
+                    if any(keyword in material["name"].lower() for keyword in keywords):
+                        return f"Risk assessment for {material['name']}:\n\n{material['description']}\n\nThis is a significant hazard that requires proper safety protocols."
+                
+                return "I need more specific information about the hazardous materials or situation to provide a risk assessment."
+            
+            else:
+                # General response
+                return "I'm your safety assistant. I can help with emergency protocols, incident information, or risk assessments. Please provide more details about what you need."
+        
+        return llm_response
     
     def compare_response_times(self, incidents):
         """Compare response times with industry standards"""
@@ -301,29 +368,68 @@ class SafetyProcessor:
             return "No documents provided for summarization."
         
         # Extract content from documents
-        contents = [doc.content for doc in documents if hasattr(doc, 'content')]
+        contents = []
+        for doc in documents:
+            if hasattr(doc, 'content'):
+                contents.append(doc.content)
+            elif isinstance(doc, dict) and 'content' in doc:
+                contents.append(doc['content'])
+            elif isinstance(doc, str):
+                contents.append(doc)
         
         if not contents:
             return "Unable to extract content from provided documents."
         
+        # Try using the LLM handler for summarization
+        try:
+            combined_content = "\n\n---\n\n".join(contents)
+            prompt = "Please summarize the following safety documents, focusing on key safety information, protocols, and critical details:\n\n" + combined_content
+            
+            llm_summary = self.llm_handler.generate_response(prompt, max_length=300)
+            
+            if llm_summary and len(llm_summary.strip()) > 10:
+                return llm_summary
+        except Exception as e:
+            self.logger.error(f"Error using LLM for summarization: {e}")
+        
+        # Fallback to basic extractive summarization
+        self.logger.warning("Falling back to basic extractive summarization")
+        
         # For a simple extractive summary, we'll select key sentences
-        # In a real implementation, this would use more sophisticated NLP techniques
         all_sentences = []
         for content in contents:
-            sentences = sent_tokenize(content)
-            all_sentences.extend(sentences)
+            try:
+                sentences = sent_tokenize(content)
+                all_sentences.extend(sentences)
+            except Exception as e:
+                self.logger.error(f"Error tokenizing content: {e}")
+                # If tokenization fails, add the content as a single item
+                all_sentences.append(content[:200] + "...")  # Truncate long content
+        
+        if not all_sentences:
+            return "Could not process documents for summarization."
         
         # For simplicity, return first sentence of each document plus a random sampling of others
-        summary_sentences = [sent_tokenize(content)[0] for content in contents if sent_tokenize(content)]
-        
-        # Add a few more sentences if there are a lot
-        if len(all_sentences) > 10:
-            # Select a few random sentences from the middle of documents
-            import random
-            additional_sentences = random.sample(all_sentences[3:-3], min(5, len(all_sentences) - 6))
-            summary_sentences.extend(additional_sentences)
-        
-        # Combine into a summary
-        summary = " ".join(summary_sentences)
-        
-        return summary
+        try:
+            summary_sentences = []
+            for content in contents:
+                sentences = sent_tokenize(content)
+                if sentences:
+                    summary_sentences.append(sentences[0])
+            
+            # Add a few more sentences if there are a lot
+            if len(all_sentences) > 10:
+                # Select a few random sentences from the middle of documents
+                import random
+                middle_sentences = all_sentences[3:-3] if len(all_sentences) > 6 else all_sentences
+                additional_sentences = random.sample(middle_sentences, min(5, len(middle_sentences)))
+                summary_sentences.extend(additional_sentences)
+            
+            # Combine into a summary
+            summary = " ".join(summary_sentences)
+            
+            return summary
+        except Exception as e:
+            self.logger.error(f"Error creating extractive summary: {e}")
+            # Last resort fallback
+            return "Document summarization failed. Please try with different documents or check formatting."
