@@ -2,44 +2,60 @@ import re
 import logging
 import nltk
 
-# Initialize NLTK components - download essential resources
+logger = logging.getLogger(__name__)
+
+# Define fallback functions and classes
+def simple_word_tokenize(text):
+    """Simple word tokenizer that splits text on whitespace and punctuation"""
+    return re.findall(r'\b\w+\b', text.lower())
+
+STOPWORDS = {'a', 'an', 'the', 'and', 'or', 'but', 'if', 'because', 'as', 'what',
+            'which', 'this', 'that', 'these', 'those', 'then', 'just', 'so', 'than',
+            'such', 'both', 'through', 'about', 'for', 'is', 'of', 'while', 'during',
+            'to', 'from', 'in', 'on', 'by', 'with', 'at'}
+
+# Simple lemmatizer class as fallback
+class SimpleWordNetLemmatizer:
+    def lemmatize(self, word, pos=None):
+        # Very basic lemmatization: handle plurals and -ing, -ed endings
+        if word.endswith('s') and len(word) > 3:
+            return word[:-1]
+        if word.endswith('ing') and len(word) > 5:
+            return word[:-3]
+        if word.endswith('ed') and len(word) > 4:
+            return word[:-2]
+        return word
+
+# Initialize NLTK components if possible
 try:
-    # Initialize required NLTK components
+    # Try to initialize NLTK components
     nltk.download('punkt', quiet=True)
     nltk.download('stopwords', quiet=True)
     nltk.download('wordnet', quiet=True)
     
-    from nltk.corpus import stopwords
-    from nltk.tokenize import word_tokenize
-    from nltk.stem import WordNetLemmatizer
-    
-    # Set up components
-    NLTK_AVAILABLE = True
+    # Test if we can actually use the components
+    try:
+        from nltk.corpus import stopwords
+        from nltk.tokenize import word_tokenize
+        from nltk.stem import WordNetLemmatizer
+        
+        # Test tokenization - this will fail if punkt_tab isn't properly loaded
+        test_tokenize = word_tokenize("This is a test.")
+        test_stop = stopwords.words('english')
+        test_lemma = WordNetLemmatizer().lemmatize("testing")
+        
+        NLTK_AVAILABLE = True
+        logger.info("NLTK components successfully loaded and tested")
+    except Exception as e:
+        logger.warning(f"NLTK components not fully functional: {e}")
+        NLTK_AVAILABLE = False
+        # Use our fallbacks
+        word_tokenize = simple_word_tokenize
 except Exception as e:
+    logger.error(f"Error initializing NLTK: {e}")
     NLTK_AVAILABLE = False
-    logging.error(f"Error initializing NLTK: {e}")
-    # Fallback implementations if NLTK unavailable
-    def word_tokenize(text):
-        return re.findall(r'\b\w+\b', text.lower())
-    
-    STOPWORDS = {'a', 'an', 'the', 'and', 'or', 'but', 'if', 'because', 'as', 'what',
-                'which', 'this', 'that', 'these', 'those', 'then', 'just', 'so', 'than',
-                'such', 'both', 'through', 'about', 'for', 'is', 'of', 'while', 'during',
-                'to', 'from', 'in', 'on', 'by', 'with', 'at'}
-    
-    # Simple lemmatizer class as fallback
-    class SimpleWordNetLemmatizer:
-        def lemmatize(self, word, pos=None):
-            # Very basic lemmatization: handle plurals and -ing, -ed endings
-            if word.endswith('s') and len(word) > 3:
-                return word[:-1]
-            if word.endswith('ing') and len(word) > 5:
-                return word[:-3]
-            if word.endswith('ed') and len(word) > 4:
-                return word[:-2]
-            return word
-
-logger = logging.getLogger(__name__)
+    # Use our fallbacks
+    word_tokenize = simple_word_tokenize
 
 class NLPEngine:
     def __init__(self):

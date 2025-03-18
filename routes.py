@@ -36,13 +36,20 @@ def chat_page():
     if 'chat_session_id' not in session:
         session['chat_session_id'] = str(uuid.uuid4())
         
-        # Create a new chat session in the database
-        chat_session = ChatSession(
-            session_id=session['chat_session_id'],
-            user_id=None  # Can be linked to a user if authentication is implemented
-        )
-        db.session.add(chat_session)
-        db.session.commit()
+        # Try to create a new chat session in the database
+        try:
+            chat_session = ChatSession(
+                session_id=session['chat_session_id'],
+                user_id=None  # Can be linked to a user if authentication is implemented
+            )
+            db.session.add(chat_session)
+            db.session.commit()
+        except Exception as e:
+            logger.warning(f"Could not create chat session in database: {e}")
+            try:
+                db.session.rollback()
+            except:
+                pass
     
     return render_template('chat.html', session_id=session['chat_session_id'])
 
@@ -61,10 +68,18 @@ def search():
         if not query:
             return jsonify({'error': 'Query is required'}), 400
         
-        # Log the search query
-        search_query = SearchQuery(query=query)
-        db.session.add(search_query)
-        db.session.commit()
+        # Try to log the search query, but continue if it fails
+        try:
+            search_query = SearchQuery(query=query)
+            db.session.add(search_query)
+            db.session.commit()
+        except Exception as db_error:
+            logger.warning(f"Could not save search query to database: {db_error}")
+            # Try to rollback in case of transaction error
+            try:
+                db.session.rollback()
+            except:
+                pass
         
         # Process the query with NLP to understand intent
         processed_query = nlp_engine.process_query(query)
@@ -81,8 +96,8 @@ def search():
             'answers': answers
         })
     except Exception as e:
-        logger.exception("Error in search endpoint")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error in search endpoint: {e}")
+        return jsonify({'error': 'An error occurred during search'}), 500
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
@@ -98,45 +113,54 @@ def chat():
         if not session_id:
             return jsonify({'error': 'Session ID is required'}), 400
         
-        # Find chat session
-        chat_session = ChatSession.query.filter_by(session_id=session_id).first()
-        
-        if not chat_session:
-            return jsonify({'error': 'Invalid session ID'}), 404
-        
-        # Update last activity
-        chat_session.last_activity = datetime.utcnow()
-        
-        # Store user message
-        user_message = ChatMessage(
-            session_id=chat_session.id,
-            message=message,
-            is_user=True
-        )
-        db.session.add(user_message)
-        
-        # Process message with NLP engine
+        # Process message with NLP engine first to ensure core functionality works
         intent = nlp_engine.extract_intent(message)
         
         # Generate response based on intent and message content
         response_text = safety_processor.generate_chat_response(message, intent)
         
-        # Store system response
-        system_message = ChatMessage(
-            session_id=chat_session.id,
-            message=response_text,
-            is_user=False
-        )
-        db.session.add(system_message)
-        db.session.commit()
+        # Try to handle the database operations, but continue if they fail
+        try:
+            # Find chat session
+            chat_session = ChatSession.query.filter_by(session_id=session_id).first()
+            
+            if chat_session:
+                # Update last activity
+                chat_session.last_activity = datetime.utcnow()
+                
+                # Store user message
+                user_message = ChatMessage(
+                    session_id=chat_session.id,
+                    message=message,
+                    is_user=True
+                )
+                db.session.add(user_message)
+                
+                # Store system response
+                system_message = ChatMessage(
+                    session_id=chat_session.id,
+                    message=response_text,
+                    is_user=False
+                )
+                db.session.add(system_message)
+                db.session.commit()
+            else:
+                logger.warning(f"Chat session not found for ID: {session_id}")
+        except Exception as db_error:
+            logger.warning(f"Database error in chat endpoint: {db_error}")
+            try:
+                db.session.rollback()
+            except:
+                pass
         
+        # Return response even if database operations failed
         return jsonify({
             'response': response_text,
             'session_id': session_id
         })
     except Exception as e:
-        logger.exception("Error in chat endpoint")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error in chat endpoint: {e}")
+        return jsonify({'error': 'An error occurred during chat processing'}), 500
 
 @app.route('/api/similarity-search', methods=['POST'])
 def similarity_search():
