@@ -1,227 +1,234 @@
 import logging
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import spacy
-from sentence_transformers import SentenceTransformer
-import faiss
-from models import SafetyProtocol, Incident
+import json
+import re
+from collections import Counter
+from models import SafetyDocument, IncidentReport
 from app import db
 
-# Load language model
-try:
-    nlp = spacy.load("en_core_web_sm")
-except:
-    # Download model if not available
-    import os
-    os.system("python -m spacy download en_core_web_sm")
-    nlp = spacy.load("en_core_web_sm")
+logger = logging.getLogger(__name__)
 
-# Load sentence transformer model for embeddings
-try:
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-except Exception as e:
-    logging.error(f"Error loading sentence transformer model: {e}")
-    model = None
+# Global variables to store document information
+safety_documents = []
+incident_reports = []
 
-# TF-IDF vectorizer as fallback
-tfidf_vectorizer = TfidfVectorizer(stop_words='english')
+def _tokenize_text(text):
+    """Split text into tokens, removing punctuation and converting to lowercase"""
+    if not text:
+        return []
+    # Convert to lowercase and split by non-alphanumeric characters
+    return [word.lower() for word in re.findall(r'\b\w+\b', text.lower())]
 
-# Global cache for document vectors
-document_embeddings = {
-    'protocols': None,
-    'incidents': None
-}
+def _load_static_data():
+    """Load data from static JSON files"""
+    try:
+        # Load emergency guidebook
+        with open('static/data/emergency_guidebook.json', 'r') as f:
+            guidebook = json.load(f)
+            
+        # Load incident reports
+        with open('static/data/incident_reports.json', 'r') as f:
+            incidents = json.load(f)
+            
+        return guidebook, incidents
+    except Exception as e:
+        logger.error(f"Error loading static data: {e}")
+        return None, None
 
-protocol_ids = []
-incident_ids = []
-
-# Initialize FAISS index
-def initialize_faiss_index():
-    global document_embeddings, protocol_ids, incident_ids
-    
-    # Get all documents
-    protocols = SafetyProtocol.query.all()
-    incidents = Incident.query.all()
-    
-    if not protocols or not incidents:
-        logging.warning("No documents found in database to index")
-        return
-    
-    protocol_texts = [f"{p.title} {p.content}" for p in protocols]
-    incident_texts = [f"{i.title} {i.description} {i.resolution or ''}" for i in incidents]
-    
-    # Store IDs for lookup
-    protocol_ids = [p.id for p in protocols]
-    incident_ids = [i.id for i in incidents]
+# Initialize document search
+def initialize_search_index():
+    """Load documents from the database or static files and prepare for search"""
+    global safety_documents, incident_reports
     
     try:
-        # Generate embeddings
-        if model:
-            protocol_embeddings = model.encode(protocol_texts)
-            incident_embeddings = model.encode(incident_texts)
+        # First try to load from database
+        db_safety_docs = SafetyDocument.query.all()
+        db_incidents = IncidentReport.query.all()
+        
+        if db_safety_docs and db_incidents:
+            safety_documents = [{
+                'id': doc.id,
+                'title': doc.title,
+                'content': doc.content,
+                'document_type': doc.document_type,
+                'tokens': set(_tokenize_text(f"{doc.title} {doc.content}")),
+                'source': 'database'
+            } for doc in db_safety_docs]
             
-            # Store embeddings for later use
-            document_embeddings['protocols'] = protocol_embeddings
-            document_embeddings['incidents'] = incident_embeddings
+            incident_reports = [{
+                'id': incident.id,
+                'title': incident.title,
+                'description': incident.description,
+                'resolution': incident.resolution,
+                'severity': incident.severity,
+                'hazard_type': incident.hazard_type,
+                'tokens': set(_tokenize_text(f"{incident.title} {incident.description} {incident.resolution or ''}")),
+                'source': 'database'
+            } for incident in db_incidents]
             
-            logging.info(f"Indexed {len(protocols)} protocols and {len(incidents)} incidents with embeddings")
+            logger.info(f"Loaded {len(safety_documents)} safety documents and {len(incident_reports)} incident reports from database")
         else:
-            # Fallback to TF-IDF if model not available
-            all_texts = protocol_texts + incident_texts
-            tfidf_matrix = tfidf_vectorizer.fit_transform(all_texts)
-            document_embeddings['protocols'] = tfidf_matrix[:len(protocol_texts)].toarray()
-            document_embeddings['incidents'] = tfidf_matrix[len(protocol_texts):].toarray()
+            # Fallback to static files
+            guidebook, incidents_data = _load_static_data()
             
-            logging.info(f"Indexed {len(protocols)} protocols and {len(incidents)} incidents with TF-IDF")
+            if guidebook and 'hazardous_materials' in guidebook:
+                for i, material in enumerate(guidebook['hazardous_materials']):
+                    doc = {
+                        'id': f"static-{i+1}",
+                        'title': material['name'],
+                        'content': f"{material['description']} Protocols: {' '.join(material['protocols'])}",
+                        'document_type': 'protocol',
+                        'emergency_response': material['emergency_response'],
+                        'tokens': set(_tokenize_text(f"{material['name']} {material['description']} {' '.join(material['protocols'])}")),
+                        'source': 'static'
+                    }
+                    safety_documents.append(doc)
+                
+            if incidents_data and 'incidents' in incidents_data:
+                for incident in incidents_data['incidents']:
+                    inc = {
+                        'id': incident['id'],
+                        'title': incident['title'],
+                        'description': incident['description'],
+                        'resolution': incident.get('resolution', ''),
+                        'severity': incident.get('severity', 0),
+                        'hazard_type': incident.get('hazard_type', ''),
+                        'tokens': set(_tokenize_text(f"{incident['title']} {incident['description']} {incident.get('resolution', '')}")),
+                        'source': 'static'
+                    }
+                    incident_reports.append(inc)
+            
+            logger.info(f"Loaded {len(safety_documents)} safety documents and {len(incident_reports)} incident reports from static files")
+    
     except Exception as e:
-        logging.error(f"Error initializing search index: {e}")
+        logger.error(f"Error initializing search index: {e}")
 
 # Search documents
 def search_documents(query, top_n=5):
-    """Search for documents using semantic search"""
-    if (document_embeddings['protocols'] is None or 
-        document_embeddings['incidents'] is None):
-        initialize_faiss_index()
+    """Search for documents using keyword-based search"""
+    global safety_documents, incident_reports
+    
+    # Initialize if needed
+    if not safety_documents and not incident_reports:
+        initialize_search_index()
     
     results = []
     
     try:
-        # Process query
-        if model:
-            query_embedding = model.encode([query])[0]
-        else:
-            # Fallback to TF-IDF
-            query_vector = tfidf_vectorizer.transform([query]).toarray()[0]
+        # Tokenize query
+        query_tokens = _tokenize_text(query)
+        query_token_set = set(query_tokens)
+        token_counts = Counter(query_tokens)
         
-        # Search protocols
-        if document_embeddings['protocols'] is not None:
-            protocol_similarities = cosine_similarity(
-                [query_embedding] if model else [query_vector], 
-                document_embeddings['protocols']
-            )[0]
+        # Search safety documents
+        for doc in safety_documents:
+            common_words = query_token_set.intersection(doc['tokens'])
             
-            # Get top protocol matches
-            protocol_indices = np.argsort(protocol_similarities)[::-1][:top_n]
-            for idx in protocol_indices:
-                if protocol_similarities[idx] > 0.3:  # Threshold for relevance
-                    protocol = SafetyProtocol.query.get(protocol_ids[idx])
+            if common_words:
+                # Calculate score based on word frequency
+                score = sum(token_counts[word] for word in common_words) / len(query_tokens)
+                
+                if score > 0.1:  # Minimum relevance threshold
                     results.append({
-                        'id': protocol.id,
-                        'title': protocol.title,
-                        'content': protocol.content[:200] + '...' if len(protocol.content) > 200 else protocol.content,
-                        'type': 'protocol',
-                        'score': float(protocol_similarities[idx]),
-                        'date': protocol.date_added.strftime('%Y-%m-%d')
+                        'id': doc['id'],
+                        'title': doc['title'],
+                        'content': doc['content'][:200] + '...' if len(doc['content']) > 200 else doc['content'],
+                        'type': doc['document_type'],
+                        'score': score,
+                        'matching_terms': list(common_words)
                     })
         
-        # Search incidents
-        if document_embeddings['incidents'] is not None:
-            incident_similarities = cosine_similarity(
-                [query_embedding] if model else [query_vector], 
-                document_embeddings['incidents']
-            )[0]
+        # Search incident reports
+        for incident in incident_reports:
+            common_words = query_token_set.intersection(incident['tokens'])
             
-            # Get top incident matches
-            incident_indices = np.argsort(incident_similarities)[::-1][:top_n]
-            for idx in incident_indices:
-                if incident_similarities[idx] > 0.3:  # Threshold for relevance
-                    incident = Incident.query.get(incident_ids[idx])
+            if common_words:
+                # Calculate score based on word frequency
+                score = sum(token_counts[word] for word in common_words) / len(query_tokens)
+                
+                if score > 0.1:  # Minimum relevance threshold
                     results.append({
-                        'id': incident.id,
-                        'title': incident.title,
-                        'content': incident.description[:200] + '...' if len(incident.description) > 200 else incident.description,
+                        'id': incident['id'],
+                        'title': incident['title'],
+                        'content': incident['description'][:200] + '...' if len(incident['description']) > 200 else incident['description'],
                         'type': 'incident',
-                        'score': float(incident_similarities[idx]),
-                        'date': incident.date_occurred.strftime('%Y-%m-%d'),
-                        'severity': incident.severity
+                        'score': score,
+                        'severity': incident['severity'],
+                        'matching_terms': list(common_words)
                     })
         
         # Sort results by score
         results.sort(key=lambda x: x['score'], reverse=True)
         
     except Exception as e:
-        logging.error(f"Error searching documents: {e}")
+        logger.error(f"Error searching documents: {e}")
         
     return results[:top_n]
 
 # Get document by ID
 def get_document_by_id(doc_type, doc_id):
     """Retrieve a document by type and ID"""
+    global safety_documents, incident_reports
+    
+    # Initialize if needed
+    if not safety_documents and not incident_reports:
+        initialize_search_index()
+    
     try:
         if doc_type == 'protocol':
-            document = SafetyProtocol.query.get(doc_id)
-            if document:
-                return {
-                    'id': document.id,
-                    'title': document.title,
-                    'content': document.content,
-                    'category': document.category,
-                    'date': document.date_added.strftime('%Y-%m-%d'),
-                    'type': 'protocol'
-                }
+            for doc in safety_documents:
+                if str(doc['id']) == str(doc_id):
+                    return doc
         elif doc_type == 'incident':
-            document = Incident.query.get(doc_id)
-            if document:
-                return {
-                    'id': document.id,
-                    'title': document.title,
-                    'description': document.description,
-                    'severity': document.severity,
-                    'date': document.date_occurred.strftime('%Y-%m-%d'),
-                    'location': document.location,
-                    'response_time': document.response_time_minutes,
-                    'resolution': document.resolution,
-                    'type': 'incident'
-                }
+            for incident in incident_reports:
+                if str(incident['id']) == str(doc_id):
+                    return incident
     except Exception as e:
-        logging.error(f"Error retrieving document: {e}")
+        logger.error(f"Error retrieving document: {e}")
         
     return None
 
 # Find similar incidents
-def get_similar_incidents(incident, top_n=5):
-    """Find incidents similar to the given incident"""
-    if document_embeddings['incidents'] is None:
-        initialize_faiss_index()
+def get_similar_incidents(incident_description, top_n=5):
+    """Find incidents similar to the given incident description"""
+    global incident_reports
+    
+    # Initialize if needed
+    if not incident_reports:
+        initialize_search_index()
     
     results = []
     
     try:
-        # Get incident text
-        incident_text = f"{incident.title} {incident.description} {incident.resolution or ''}"
+        # Tokenize the incident description
+        query_tokens = _tokenize_text(incident_description)
+        query_token_set = set(query_tokens)
+        token_counts = Counter(query_tokens)
         
-        # Generate embedding for the incident
-        if model:
-            incident_embedding = model.encode([incident_text])[0]
-        else:
-            incident_vector = tfidf_vectorizer.transform([incident_text]).toarray()[0]
+        # Find similar incidents
+        for incident in incident_reports:
+            common_words = query_token_set.intersection(incident['tokens'])
+            
+            if common_words:
+                # Calculate score
+                score = sum(token_counts[word] for word in common_words) / len(query_tokens)
+                
+                if score > 0.1:  # Minimum relevance threshold
+                    result = {
+                        'id': incident['id'],
+                        'title': incident['title'],
+                        'description': incident['description'][:150] + '...' if len(incident['description']) > 150 else incident['description'],
+                        'severity': incident['severity'],
+                        'hazard_type': incident.get('hazard_type', 'unknown'),
+                        'resolution': incident.get('resolution', ''),
+                        'similarity_score': score,
+                        'matching_terms': list(common_words)
+                    }
+                    results.append(result)
         
-        # Calculate similarities
-        similarities = cosine_similarity(
-            [incident_embedding] if model else [incident_vector], 
-            document_embeddings['incidents']
-        )[0]
+        # Sort by similarity score
+        results.sort(key=lambda x: x['similarity_score'], reverse=True)
         
-        # Get indices of most similar incidents
-        similar_indices = np.argsort(similarities)[::-1][:top_n+1]  # +1 to account for self-similarity
-        
-        # Get similar incidents (excluding self)
-        for idx in similar_indices:
-            similar_id = incident_ids[idx]
-            if similar_id != incident.id and similarities[idx] > 0.3:
-                similar_incident = Incident.query.get(similar_id)
-                results.append({
-                    'id': similar_incident.id,
-                    'title': similar_incident.title,
-                    'description': similar_incident.description[:150] + '...',
-                    'severity': similar_incident.severity,
-                    'date': similar_incident.date_occurred.strftime('%Y-%m-%d'),
-                    'response_time': similar_incident.response_time_minutes,
-                    'similarity_score': float(similarities[idx])
-                })
-    
     except Exception as e:
-        logging.error(f"Error finding similar incidents: {e}")
+        logger.error(f"Error finding similar incidents: {e}")
     
-    return results
+    return results[:top_n]

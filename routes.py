@@ -1,149 +1,224 @@
-import logging
+from flask import render_template, request, jsonify, session, redirect, url_for
+import uuid
 from datetime import datetime
-from flask import render_template, request, jsonify, redirect, url_for, session
+import logging
+
 from app import app, db
-from models import SafetyProtocol, Incident, SearchQuery, ChatSession, ChatMessage
-from search_engine import search_documents, get_document_by_id, get_similar_incidents
-from chatbot import process_chat_message
-from risk_analysis import categorize_risk, predict_risk
-from data.sample_protocols import load_sample_protocols
-from data.sample_incidents import load_sample_incidents
+from models import SafetyDocument, SearchQuery, IncidentReport, ChatSession, ChatMessage
+from nlp_engine import NLPEngine
+from safety_processor import SafetyProcessor
+from vector_store import VectorStore
+from risk_analyzer import RiskAnalyzer
 
-# Initialize sample data if database is empty
-@app.before_first_request
-def initialize_data():
-    if SafetyProtocol.query.count() == 0:
-        load_sample_protocols()
-        logging.info("Sample safety protocols loaded")
-    
-    if Incident.query.count() == 0:
-        load_sample_incidents()
-        logging.info("Sample incidents loaded")
+# Initialize components
+nlp_engine = NLPEngine()
+safety_processor = SafetyProcessor()
+vector_store = VectorStore()
+risk_analyzer = RiskAnalyzer()
 
-# Home page
+# Logger
+logger = logging.getLogger(__name__)
+
 @app.route('/')
 def index():
+    """Home page route"""
     return render_template('index.html')
 
-# Search endpoint
 @app.route('/search')
-def search():
-    query = request.args.get('q', '')
-    if not query:
-        return render_template('search.html', results=[], query='')
-    
-    # Log the search query
-    search_record = SearchQuery(query_text=query)
-    db.session.add(search_record)
-    db.session.commit()
-    
-    # Process search
-    results = search_documents(query)
-    return render_template('search.html', results=results, query=query)
+def search_page():
+    """Search interface page"""
+    return render_template('search.html')
 
-# Document view endpoint
-@app.route('/document/<doc_type>/<int:doc_id>')
-def document_view(doc_type, doc_id):
-    document = get_document_by_id(doc_type, doc_id)
-    if not document:
-        return render_template('document_view.html', error="Document not found"), 404
-    
-    return render_template('document_view.html', document=document, doc_type=doc_type)
-
-# Incident comparison endpoint
-@app.route('/incident/compare/<int:incident_id>')
-def incident_comparison(incident_id):
-    incident = Incident.query.get_or_404(incident_id)
-    similar_incidents = get_similar_incidents(incident)
-    
-    return render_template('incident_comparison.html', 
-                           incident=incident, 
-                           similar_incidents=similar_incidents)
-
-# Risk assessment endpoint
-@app.route('/risk-assessment')
-def risk_assessment():
-    incidents = Incident.query.all()
-    categorized_incidents = categorize_risk(incidents)
-    predicted_risks = predict_risk()
-    
-    return render_template('risk_assessment.html', 
-                           categorized_incidents=categorized_incidents,
-                           predicted_risks=predicted_risks)
-
-# Chat API endpoints
-@app.route('/api/chat/start', methods=['POST'])
-def start_chat():
-    # Create a new chat session
-    chat_session = ChatSession()
-    db.session.add(chat_session)
-    db.session.commit()
-    
-    session['chat_session_id'] = chat_session.id
-    return jsonify({'session_id': chat_session.id})
-
-@app.route('/api/chat/message', methods=['POST'])
-def chat_message():
-    data = request.get_json()
-    message = data.get('message', '')
-    session_id = session.get('chat_session_id')
-    
-    if not session_id:
-        # Create a new session if one doesn't exist
-        chat_session = ChatSession()
+@app.route('/chat')
+def chat_page():
+    """Interactive chatbot interface"""
+    # Generate a session ID if one doesn't exist
+    if 'chat_session_id' not in session:
+        session['chat_session_id'] = str(uuid.uuid4())
+        
+        # Create a new chat session in the database
+        chat_session = ChatSession(
+            session_id=session['chat_session_id'],
+            user_id=None  # Can be linked to a user if authentication is implemented
+        )
         db.session.add(chat_session)
         db.session.commit()
-        session_id = chat_session.id
-        session['chat_session_id'] = session_id
     
-    # Save user message
-    user_message = ChatMessage(
-        session_id=session_id,
-        is_user=True,
-        message=message
-    )
-    db.session.add(user_message)
-    
-    # Process message and get response
-    response_text = process_chat_message(message)
-    
-    # Save system response
-    system_message = ChatMessage(
-        session_id=session_id,
-        is_user=False,
-        message=response_text
-    )
-    db.session.add(system_message)
-    db.session.commit()
-    
-    return jsonify({
-        'response': response_text
-    })
+    return render_template('chat.html', session_id=session['chat_session_id'])
 
-@app.route('/api/chat/history')
-def chat_history():
-    session_id = session.get('chat_session_id')
-    if not session_id:
-        return jsonify({'messages': []})
-    
-    messages = ChatMessage.query.filter_by(session_id=session_id).order_by(ChatMessage.timestamp).all()
-    messages_list = [
-        {
-            'id': msg.id,
-            'is_user': msg.is_user,
-            'message': msg.message,
-            'timestamp': msg.timestamp.strftime('%H:%M:%S')
-        }
-        for msg in messages
-    ]
-    
-    return jsonify({'messages': messages_list})
+@app.route('/risk-assessment')
+def risk_assessment():
+    """Risk assessment and visualization page"""
+    return render_template('risk_assessment.html')
+
+@app.route('/api/search', methods=['POST'])
+def search():
+    """API endpoint for NLP search functionality"""
+    try:
+        data = request.json
+        query = data.get('query', '')
+        
+        if not query:
+            return jsonify({'error': 'Query is required'}), 400
+        
+        # Log the search query
+        search_query = SearchQuery(query=query)
+        db.session.add(search_query)
+        db.session.commit()
+        
+        # Process the query with NLP to understand intent
+        processed_query = nlp_engine.process_query(query)
+        
+        # Retrieve relevant documents
+        results = safety_processor.retrieve_documents(processed_query)
+        
+        # Prepare contextual answers
+        answers = safety_processor.generate_contextual_answer(query, results)
+        
+        return jsonify({
+            'query': query,
+            'results': results,
+            'answers': answers
+        })
+    except Exception as e:
+        logger.exception("Error in search endpoint")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/chat', methods=['POST'])
+def chat():
+    """API endpoint for chatbot interaction"""
+    try:
+        data = request.json
+        message = data.get('message', '')
+        session_id = data.get('session_id', '')
+        
+        if not message:
+            return jsonify({'error': 'Message is required'}), 400
+        
+        if not session_id:
+            return jsonify({'error': 'Session ID is required'}), 400
+        
+        # Find chat session
+        chat_session = ChatSession.query.filter_by(session_id=session_id).first()
+        
+        if not chat_session:
+            return jsonify({'error': 'Invalid session ID'}), 404
+        
+        # Update last activity
+        chat_session.last_activity = datetime.utcnow()
+        
+        # Store user message
+        user_message = ChatMessage(
+            session_id=chat_session.id,
+            message=message,
+            is_user=True
+        )
+        db.session.add(user_message)
+        
+        # Process message with NLP engine
+        intent = nlp_engine.extract_intent(message)
+        
+        # Generate response based on intent and message content
+        response_text = safety_processor.generate_chat_response(message, intent)
+        
+        # Store system response
+        system_message = ChatMessage(
+            session_id=chat_session.id,
+            message=response_text,
+            is_user=False
+        )
+        db.session.add(system_message)
+        db.session.commit()
+        
+        return jsonify({
+            'response': response_text,
+            'session_id': session_id
+        })
+    except Exception as e:
+        logger.exception("Error in chat endpoint")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/similarity-search', methods=['POST'])
+def similarity_search():
+    """API endpoint for finding similar incidents"""
+    try:
+        data = request.json
+        incident_description = data.get('description', '')
+        
+        if not incident_description:
+            return jsonify({'error': 'Incident description is required'}), 400
+        
+        # Find similar incidents
+        similar_incidents = vector_store.find_similar_incidents(incident_description)
+        
+        # Analyze and compare response times
+        comparison = safety_processor.compare_response_times(similar_incidents)
+        
+        return jsonify({
+            'similar_incidents': similar_incidents,
+            'comparison': comparison
+        })
+    except Exception as e:
+        logger.exception("Error in similarity search endpoint")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/risk-assessment', methods=['POST'])
+def assess_risk():
+    """API endpoint for risk assessment"""
+    try:
+        data = request.json
+        incident_details = data.get('details', '')
+        
+        if not incident_details:
+            return jsonify({'error': 'Incident details are required'}), 400
+        
+        # Assess risk severity
+        severity, rationale = risk_analyzer.assess_severity(incident_details)
+        
+        # Generate predictive insights
+        insights = risk_analyzer.generate_predictive_insights(incident_details, severity)
+        
+        return jsonify({
+            'severity': severity,
+            'rationale': rationale,
+            'insights': insights
+        })
+    except Exception as e:
+        logger.exception("Error in risk assessment endpoint")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/document-summary', methods=['POST'])
+def document_summary():
+    """API endpoint for multi-document summarization"""
+    try:
+        data = request.json
+        document_ids = data.get('document_ids', [])
+        
+        if not document_ids:
+            return jsonify({'error': 'Document IDs are required'}), 400
+        
+        # Retrieve documents
+        documents = [SafetyDocument.query.get(doc_id) for doc_id in document_ids if SafetyDocument.query.get(doc_id)]
+        
+        if not documents:
+            return jsonify({'error': 'No valid documents found'}), 404
+        
+        # Generate summary
+        summary = safety_processor.summarize_multiple_documents(documents)
+        
+        return jsonify({
+            'summary': summary,
+            'document_count': len(documents)
+        })
+    except Exception as e:
+        logger.exception("Error in document summary endpoint")
+        return jsonify({'error': str(e)}), 500
 
 # Error handlers
 @app.errorhandler(404)
 def page_not_found(e):
-    return render_template('base.html', error="Page not found"), 404
+    return render_template('404.html'), 404
 
 @app.errorhandler(500)
 def server_error(e):
-    return render_template('base.html', error="Internal server error"), 500
+    return render_template('500.html'), 500
