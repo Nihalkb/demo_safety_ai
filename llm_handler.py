@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 class LLMHandler:
     def __init__(self):
         """Initialize the LLM handler with OpenAI"""
-        self.api_key = os.environ.get("OPENAI_API_KEY")
+        self.api_key = "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"
         self.client = None
         self.cache = {}  # Simple in-memory cache
         self.cache_ttl = 3600  # Cache TTL in seconds (1 hour)
